@@ -4,31 +4,17 @@ import * as bodyParser from 'koa-bodyparser';
 import { Redis } from 'ioredis'
 import { RippleAPI } from 'ripple-lib'
 import { Server } from 'net';
-import { createOrUpdate as createOrUpdateAccount, show as showAccount, destroy as destroyAccount } from './controllers/accountsController'
-import { create as createThreshold } from './controllers/accountsBalanceController';
+import { create as createAccount, show as showAccount, destroy as destroyAccount } from './controllers/accountsController'
 import axios from 'axios'
 import { BigNumber } from 'bignumber.js'
 import Debug from 'debug'
-import { normalizeAsset } from './utils/normalizeAsset';
+import { create as createAccountMessage } from './controllers/accountsMessagesController'
+import { create as createAccountSettlement } from './controllers/accountsSettlementController'
 const debug = Debug('xrp-settlement-engine')
+import { Account } from './models/account'
 
 const DEFAULT_SETTLEMENT_ENGINE_PREFIX = 'xrp'
 const DEFAULT_MIN_DROPS_TO_SETTLE = 10000
-
-export type BalanceUpdate = {
-  balance: number,
-  timestamp: number
-}
-
-export type Account = {
-  id: string,
-  ledgerAddress: string,
-  scale: number,
-  minimumBalance?: string,
-  maximumBalance: string,
-  settlementThreshold?: string
-  settleTo?: string //Not sure this is needed
-}
 
 /**
  * 
@@ -74,11 +60,11 @@ export class XrpSettlementEngine {
 
   constructor(config: XrpSettlementEngineConfig) {
     this.app = new Koa()
+    this.app.use(async (ctx, next) => {
+      if (ctx.path.includes('messages')) ctx.disableBodyParser = true;
+      await next();
+    });
     this.app.use(bodyParser())
-    this.router = new Router()
-    this.setupRoutes()
-    this.bindStoragePrefix()
-    this.app.use(this.router.routes())
 
     this.address = config.address
     this.secret = config.secret
@@ -92,6 +78,17 @@ export class XrpSettlementEngine {
       server: config.rippledUri || 'wss://s.altnet.rippletest.net:51233'
     })
     this.minDropsToSettle = config.minDropsToSettle || DEFAULT_MIN_DROPS_TO_SETTLE
+
+    // Add redis to context
+    this.app.context.redis = this.redis
+    this.app.context.settlement_prefix = DEFAULT_SETTLEMENT_ENGINE_PREFIX
+    this.app.context.configAccount = this.configAccount.bind(this)
+    this.app.context.settleAccount = this.settleAccount.bind(this)
+
+    this.router = new Router()
+    this.setupRoutes()
+
+    this.app.use(this.router.routes())
   }
 
   public async start() {
@@ -108,29 +105,15 @@ export class XrpSettlementEngine {
   }
 
   private setupRoutes() {
-    this.router.put('/accounts', (ctx) => createOrUpdateAccount(ctx, this.redis))
+    this.router.post('/accounts', (ctx) => createAccount(ctx, this.redis))
     this.router.get('/accounts/:id', (ctx) => showAccount(ctx, this.redis))
     this.router.delete('/accounts/:id', (ctx) => destroyAccount(ctx, this.redis))
 
-    this.router.post('/accounts/:id/balance', 
-    async (ctx, next) => {
-      //Get the account and bind to ctx
-      const account =  await this.redis.get(`${ctx.settlement_prefix}:accounts:${ctx.params.id}`)
-      if(account) {
-        ctx.account = JSON.parse(account)
-      } else {
-        ctx.throw(404)
-      }
-      await next()
-    },
-    (ctx) => createThreshold(ctx, this.redis, this.handleBalanceUpdate.bind(this)))
-  }
+    // Account Messages
+    this.router.post('/accounts/:id/messages', this.findAccountMiddleware, createAccountMessage)
 
-  private bindStoragePrefix() {
-    this.app.use(async (ctx, next) => {
-      ctx.settlement_prefix = DEFAULT_SETTLEMENT_ENGINE_PREFIX
-      await next()
-    })
+    // Account Settlements
+    this.router.post('/accounts/:id/settlement', this.findAccountMiddleware , createAccountSettlement)
   }
 
   private async subscribeToTransactions() {
@@ -140,26 +123,10 @@ export class XrpSettlementEngine {
     })
   }
 
-  async  handleBalanceUpdate(account: Account, update: BalanceUpdate) {
-    const { settlementThreshold, settleTo = '0' } = account
-    const bnSettleThreshold = settlementThreshold ? BigInt(settlementThreshold) : undefined
-    const bnSettleTo = BigInt(settleTo)
-    const balance = BigInt(update.balance)
-
-    const settle = bnSettleThreshold && bnSettleThreshold > balance
-    if (!settle) return
-
-    const settleAmount = bnSettleTo - balance
-    debug(`settlement required for ${settleAmount} to account: ${account.id} (XRP address: ${account.ledgerAddress})`)
-    const ledgerSettleAmount = normalizeAsset(account.scale, this.assetScale, settleAmount)
-    await this.settle(account, ledgerSettleAmount.toString())
-  }
-
   /** Should be triggered based on  */
-  async settle(account: Account, drops: string) {
-    debug(`Attempting to send ${drops} XRP drops to account: ${account.id} (XRP address: ${account.ledgerAddress})`)
+  async settleAccount(account: Account, drops: string) {
+    debug(`Attempting to send ${drops} XRP drops to account: ${account.id} (XRP address: ${account.xrpAddress})`)
     try {
-      console.log(drops, typeof drops)
       const payment = await this.rippleClient.preparePayment(this.address, {
         source: {
           address: this.address,
@@ -169,7 +136,7 @@ export class XrpSettlementEngine {
           }
         },
         destination: {
-          address: account.ledgerAddress,
+          address: account.xrpAddress || '',
           minAmount: {
             value: '' + drops,
             currency: 'drops'
@@ -182,21 +149,72 @@ export class XrpSettlementEngine {
       const { signedTransaction } = this.rippleClient.sign(payment.txJSON, this.secret)
       const result = await this.rippleClient.submit(signedTransaction)
       if (result.resultCode === 'tesSUCCESS') {
-        debug(`Sent ${drops} drop payment to account: ${account} (xrpAddress: ${account.ledgerAddress})`)
-        await this.updateBalance(account, drops)
+        debug(`Sent ${drops} drop payment to account: ${account} (xrpAddress: ${account.xrpAddress})`)
       }
     } catch (err) {
-      console.error(`Error preparing and submitting payment to rippled. Settlement to account: ${account} (xrpAddress: ${account.ledgerAddress}) for ${drops} drops failed:`, err)
+      console.error(`Error preparing and submitting payment to rippled. Settlement to account: ${account} (xrpAddress: ${account.xrpAddress}) for ${drops} drops failed:`, err)
     }
+  }
+
+  async findAccountMiddleware(ctx: Koa.Context, next: () => Promise<any>) {
+    const account =  await ctx.redis.get(`${ctx.settlement_prefix}:accounts:${ctx.params.id}`)
+    if(account) {
+      ctx.account = JSON.parse(account)
+    } else {
+      ctx.throw(404)
+    }
+    await next()
+  }
+
+  async configAccount(accountId: string) {
+    const url = `${this.connectorUrl}\\accounts\\${accountId}\\messages`
+    const message = {
+      type: 'config',
+      data: {
+        xrpAddress: this.address
+      }
+    }
+    await axios.post(url, Buffer.from(JSON.stringify(message)), {
+      timeout: 10000,
+      headers: {
+        'Content-type': 'application/octet-stream'
+      }
+    }).then(response => {
+      console.log('Config successful for account:\t', accountId)
+      //TODO add logic to set the account to ready state
+    }).catch(error => {
+      console.log('Error attempting to send account config, attemping again in 5000ms')
+      //need to add retry logic and store the underlaying setTimeout to be able to cancel it
+      const retryTimeout = setTimeout(() => this.configAccount(accountId), 5000)
+
+      retryTimeout.unref()
+    })
+  }
+
+  async notifySettlement(accountId: string, amount: string) {
+    const url = `${this.connectorUrl}\\accounts\\${accountId}\\settlement`
+    const message = {
+      amount,
+      scale: 6
+    }
+    await axios.post(url, message, {
+      timeout: 10000
+    }).then(response => {
+      //TODO add logic to set the account to ready state
+    }).catch(error => {
+      //need to add retry logic and store the underlaying setTimeout to be able to cancel it
+      
+    })
   }
 
   /**
    * Handle incoming transaction from the ledger
    */
   private async handleTransaction(tx: any) {
-    if (!tx.validated || tx.engine_result !== 'tesSUCCESS' || tx.transaction.TransactionType !== 'Payment' || tx.transaction.Destination !== this.address) {
+    if (!tx.validated || tx.meta.TransactionResult !== 'tesSUCCESS' || tx.transaction.TransactionType !== 'Payment' || tx.transaction.Destination !== this.address) {
       return
     }
+    console.log('validated')
 
     // Parse amount received from transaction
     let drops
@@ -212,15 +230,15 @@ export class XrpSettlementEngine {
     }
 
     const fromAddress = tx.transaction.Account
-    debug(`Got incoming XRP payment for ${drops} drops from XRP address: ${fromAddress}`)
+    console.log(`Got incoming XRP payment for ${drops} drops from XRP address: ${fromAddress}`)
 
     try {
       //TODO: Determine who the balance came from
-      const accountId = await this.redis.get(`${DEFAULT_SETTLEMENT_ENGINE_PREFIX}:ledgeraddress_accountid:${fromAddress}`)
+      const accountId = await this.redis.get(`${DEFAULT_SETTLEMENT_ENGINE_PREFIX}:xrpAddress:${fromAddress}:accountId`)
       const accountJSON = await this.redis.get(`${DEFAULT_SETTLEMENT_ENGINE_PREFIX}:accounts:${accountId}`)
       if(accountJSON) {
         const account = JSON.parse(accountJSON)
-        await this.updateBalance(account, drops.toString())
+        await this.notifySettlement(account.id, drops.toString())
         debug(`Credited account: ${account} for incoming settlement, balance is now: ${drops.toString()}`)
       }
     } catch (err) {
@@ -231,21 +249,5 @@ export class XrpSettlementEngine {
         console.warn('Got incoming payment from an unknown account: ', JSON.stringify(tx))
       }
     }
-  }
-
-  /**
-   * Notify the connector that the balance has been updated
-   * NOTE! This needs to send an update in the normalized assetScale for the account
-   * TODO: Possible retry logic required
-   */
-  async updateBalance(account: Account, drops: string) {
-    
-    //Normalize the drops of the ledger into the accounts scale
-    const amount = normalizeAsset(this.assetScale, account.scale, BigInt(drops))
-    
-    const url = `${this.connectorUrl}\\${account}\\updateBalance`
-    return axios.post(url, {
-      amount: amount.toString()
-    })
   }
 }

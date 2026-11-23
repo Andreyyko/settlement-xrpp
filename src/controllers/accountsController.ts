@@ -1,14 +1,17 @@
 import { Context } from "koa";
 import { Redis } from "ioredis";
+import { Account } from "../models/account";
 
 
 /** Create account if it does not exists or update if it does exist*/
-export async function createOrUpdate(ctx: Context, redis: Redis) {
+export async function create(ctx: Context, redis: Redis) {
     let body = ctx.request.body
+    let account: Account = {
+        id: body.id
+    }
 
-    await redis.set(`${ctx.settlement_prefix}:accounts:${body.id}`, JSON.stringify(body))
-    await redis.set(`${ctx.settlement_prefix}:ledgeraddress_account:${body.ledgerAddress}`, body.id)
-
+    await ctx.redis.set(`${ctx.settlement_prefix}:accounts:${account.id}`, JSON.stringify(account))
+    ctx.configAccount(account.id)
 
     ctx.status = 200
 }
