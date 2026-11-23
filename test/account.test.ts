@@ -1,11 +1,11 @@
 import 'mocha'
 import * as sinon from 'sinon'
 import * as Chai from 'chai'
-import { XrpSettlementEngine } from '../src/index'
+import {XrpSettlementEngine} from '../src'
 import axios from 'axios'
-import * as RedisIo from 'ioredis';
-import { RippleAPI } from 'ripple-lib'
-import { Mockttp, getLocal } from 'mockttp';
+import * as RedisIo from 'ioredis'
+import {RippleAPI} from 'ripple-lib'
+
 const assert = Object.assign(Chai.assert, sinon.assert)
 const Redis = require('ioredis-mock');
 
@@ -13,8 +13,6 @@ describe('Accounts', function () {
   let engine: XrpSettlementEngine
   let redis: RedisIo.Redis
   let rippleApi: RippleAPI
-  let mockttp: Mockttp
-
   let dummyAccount = {
     id: 'testId'
   }
@@ -22,8 +20,6 @@ describe('Accounts', function () {
   beforeEach(async () => {
     redis = new Redis()
     rippleApi = new RippleAPI()
-    mockttp = getLocal()
-    await mockttp.start(7777)
 
     sinon.stub(rippleApi, 'connect').callsFake(() => Promise.resolve())
     sinon.stub(rippleApi, 'disconnect').callsFake(() => Promise.resolve())
@@ -35,20 +31,19 @@ describe('Accounts', function () {
       assetScale: 6,
       redis,
       rippledClient: rippleApi,
-      connectorUrl: 'http://localhost:3001'
+      connectorUrl: 'http://localhost:7777'
     })
     await engine.start()
   })
 
   afterEach(async () => {
-    await mockttp.stop()
     await engine.shutdown()
   })
 
   it('can add an account', async () => {
     const response = await axios.post('http://localhost:3000/accounts', dummyAccount).catch(error => {throw new Error(error.message)})
-    
-    assert.strictEqual(response.status, 200)
+
+    assert.strictEqual(response.status, 201)
     const account = await redis.get('xrp:accounts:testId')
     if(account) {
       assert.deepEqual(JSON.parse(account), dummyAccount)
@@ -57,25 +52,38 @@ describe('Accounts', function () {
     }
   })
 
-  it('adding an account sends a post request to the connector to set thresholds', async () => {
-    //TODO:
+  it('adding an account that already exists does nothing', async () => {
+    const existingAccount = {
+      ...dummyAccount
+    }
+    await redis.set(`xrp:accounts:${existingAccount.id}`, JSON.stringify(existingAccount))
+
+    const response = await axios.post('http://localhost:3000/accounts', dummyAccount).catch(error => {throw new Error(error.message)})
+
+    assert.strictEqual(response.status, 201)
+    const account = await redis.get('xrp:accounts:testId')
+    if(account) {
+      assert.deepEqual(JSON.parse(account), existingAccount)
+    } else {
+      throw new Error('account was not created in datastore')
+    }
   })
 
   it('can get an account', async () => {
-    redis.set(`xrp:accounts:${dummyAccount.id}`, JSON.stringify(dummyAccount))
+    await redis.set(`xrp:accounts:${dummyAccount.id}`, JSON.stringify(dummyAccount))
 
     const response = await axios.get(`http://localhost:3000/accounts/${dummyAccount.id}`).catch(error => {throw new Error(error.message)})
-    
+
     assert.strictEqual(response.status, 200)
     assert.deepEqual(response.data, dummyAccount)
   })
 
   it('can remove an account', async () => {
-    redis.set(`xrp:accounts:${dummyAccount.id}`, JSON.stringify(dummyAccount))
+    await redis.set(`xrp:accounts:${dummyAccount.id}`, JSON.stringify(dummyAccount))
 
     const response = await axios.delete(`http://localhost:3000/accounts/${dummyAccount.id}`).catch(error => {throw new Error(error.message)})
 
-    assert.strictEqual(response.status, 200)
+    assert.strictEqual(response.status, 204)
     const account = await redis.get('xrp:accounts:testId')
     assert.isNull(account)
   })
